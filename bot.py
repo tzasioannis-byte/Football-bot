@@ -1,17 +1,16 @@
 import os
 import math
-import asyncio
 import base64
 import httpx
 import json
 import re
-import google.generativeai as genai
+from groq import Groq
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 def poisson_pmf(k, lam):
     if lam <= 0: return 1.0 if k == 0 else 0.0
@@ -32,13 +31,13 @@ def run_poisson(lH, lA, max_goals=8):
             if h + a > 2: over25 += p
             if h > 0 and a > 0: btts += p
     top5 = sorted(scores, key=lambda x: -x[2])[:5]
-    return {"home": home, "draw": draw, "away": away, "over25": over25, "under25": 1-over25, "btts": btts, "lH": lH, "lA": lA, "top5": top5}
+    return {"home": home, "draw": draw, "away": away, "over25": over25, "under25": 1-over25, "btts": btts, "top5": top5}
 
 LEAGUE_AVGS = {
     "premier league": (1.53, 1.15), "la liga": (1.44, 1.09),
     "serie a": (1.46, 1.11), "ligue 1": (1.40, 1.08),
     "bundesliga": (1.56, 1.18), "super lig": (1.50, 1.10),
-    "super league": (1.38, 0.98), "champions league": (1.55, 1.20),
+    "super league": (1.38, 0.98),
 }
 
 def get_league_avg(league_name):
@@ -46,25 +45,26 @@ def get_league_avg(league_name):
         if key in league_name.lower(): return val
     return (1.45, 1.10)
 
-def gemini_search(prompt):
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash", tools="google_search_retrieval")
-    response = model.generate_content(prompt)
-    return response.text
-
-def gemini_vision(prompt, image_bytes):
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    image_part = {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode()}
-    response = model.generate_content([prompt, image_part])
-    return response.text
+def groq_ask(prompt):
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=600,
+        temperature=0.3,
+    )
+    return response.choices[0].message.content
 
 def analyze_match(home_team, away_team, league="Premier League"):
     avg_home, avg_away = get_league_avg(league)
-    stats_prompt = f"""Search for 2025-2026 season stats for {home_team} and {away_team} in {league}.
-Find average goals scored/conceded per match and last 5 results form.
-Return ONLY this JSON (no markdown, no explanation):
-{{"home_scored":1.5,"home_conceded":1.0,"away_scored":1.2,"away_conceded":1.4,"home_form":"WWDLW","away_form":"LDWWL","context":"brief team news"}}"""
 
-    stats_text = gemini_search(stats_prompt)
+    prompt = f"""You are a football statistics expert. Based on your knowledge of the 2025-2026 season, provide stats for {home_team} (home) and {away_team} (away) in {league}.
+
+Return ONLY this JSON, no markdown, no explanation:
+{{"home_scored":1.5,"home_conceded":1.0,"away_scored":1.2,"away_conceded":1.4,"home_form":"WWDLW","away_form":"LDWWL","context":"key team news in one sentence"}}
+
+Use realistic 2025-26 season averages. home_scored/home_conceded are for {home_team}'s home games. away_scored/away_conceded are for {away_team}'s away games."""
+
+    stats_text = groq_ask(prompt)
     stats = {"home_scored": avg_home, "home_conceded": avg_away, "away_scored": avg_away, "away_conceded": avg_home, "home_form": "?????", "away_form": "?????", "context": ""}
     try:
         m = re.search(r'\{[^{}]*\}', stats_text, re.DOTALL)
@@ -104,30 +104,41 @@ Return ONLY this JSON (no markdown, no explanation):
 ▶️ Goals: *{ou_label}* ({ou_prob*100:.1f}%)
 ▶️ BTTS: *{'Ναι ✅' if r['btts']>0.52 else 'Όχι ❌'}* ({r['btts']*100:.1f}%)
 
-⚠️ _Μαθηματική ανάλυση — δεν εγγυάται κέρδος._"""
+⚠️ _Ανάλυση βάσει στατιστικών — δεν εγγυάται κέρδος._"""
 
 def analyze_odds_image(image_bytes):
-    prompt = """Αυτή είναι εικόνα με αποδόσεις ποδοσφαίρου από bookmaker.
-Για κάθε αγώνα δώσε:
-⚽ [Ομάδα Α] vs [Ομάδα Β] ([ώρα])
+    # Groq vision
+    image_b64 = base64.b64encode(image_bytes).decode()
+    response = groq_client.chat.completions.create(
+        model="llama-4-scout-17b-16e-instruct",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": """Αυτή είναι εικόνα με αποδόσεις ποδοσφαίρου από bookmaker.
+Για κάθε αγώνα δώσε ανάλυση στα ελληνικά:
+⚽ [Ομάδα Α] vs [Ομάδα Β]
 📊 1=[X] | X=[X] | 2=[X]
 💡 Implied: 1=[X]% | X=[X]% | 2=[X]%
-🎯 Σύσταση σημείου: [τι και γιατί - 1 γραμμή]
-⚽ Goals: [Over/Under - γιατί]
----
-Implied = 1/απόδοση × 100. Γράψε στα ελληνικά."""
-    return gemini_vision(prompt, image_bytes)
+🎯 Σύσταση: [ποιο σημείο και γιατί - 1 γραμμή]
+⚽ Goals: [Over/Under σύσταση]
+---"""}
+            ]
+        }],
+        max_tokens=2000,
+    )
+    return response.choices[0].message.content
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚽ *Football Value Analyzer*\n\nΣτείλε μου:\n📝 `Man City vs Newcastle`\n📝 `Juventus vs Como, Serie A`\n📸 Screenshot αποδόσεων\n\nΧρησιμοποιώ Poisson + Google Search 🎯", parse_mode="Markdown")
+    await update.message.reply_text("⚽ *Football Value Analyzer*\n\nΣτείλε μου:\n📝 `Man City vs Newcastle`\n📝 `Juventus vs Como, Serie A`\n📸 Screenshot αποδόσεων\n\nPoisson Model + AI Analysis 🎯", parse_mode="Markdown")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📖 *Οδηγίες:*\n\n`Ομάδα Α vs Ομάδα Β`\n`Ομάδα Α vs Ομάδα Β, League`\n📸 Φωτογραφία αποδόσεων\n\n⏱ ~15-20 δευτερόλεπτα ανά ανάλυση", parse_mode="Markdown")
+    await update.message.reply_text("📖 *Οδηγίες:*\n\n`Ομάδα Α vs Ομάδα Β`\n`Ομάδα Α vs Ομάδα Β, League`\n📸 Φωτογραφία αποδόσεων\n\n⏱ ~10 δευτερόλεπτα ανά ανάλυση", parse_mode="Markdown")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.startswith("/"): return
-    await update.message.reply_text("🔍 Ψάχνω στατιστικά... (~20 δευτ.)")
+    await update.message.reply_text("🔍 Αναλύω... (~10 δευτ.)")
     try:
         league = "Premier League"
         if "," in text:
@@ -147,7 +158,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Σφάλμα: {str(e)[:200]}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Αναλύω αποδόσεις... (~20 δευτ.)")
+    await update.message.reply_text("📸 Αναλύω αποδόσεις... (~15 δευτ.)")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
@@ -155,12 +166,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             image_bytes = (await hc.get(file.file_path)).content
         result = analyze_odds_image(image_bytes)
         for i in range(0, len(result), 4000):
-            await update.message.reply_text(result[i:i+4000], parse_mode="Markdown")
+            await update.message.reply_text(result[i:i+4000])
     except Exception as e:
         await update.message.reply_text(f"❌ Σφάλμα: {str(e)[:200]}")
 
 def main():
-    print("🤖 Football Analyzer Bot starting...")
+    print("🤖 Football Analyzer Bot starting with Groq...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
